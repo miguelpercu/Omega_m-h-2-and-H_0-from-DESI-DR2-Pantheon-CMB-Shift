@@ -1,0 +1,327 @@
+# ============================================================
+# Cosmological Parameter Measurement from DESI DR2 + Pantheon+ + CMB
+# Fixed version - handles 1D covariance format
+# ============================================================
+
+import subprocess, sys
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                       "emcee", "corner"])
+
+import os, urllib.request, time, json, zipfile
+import numpy as np
+from scipy.integrate import quad
+from scipy.linalg import cho_factor, cho_solve
+import emcee, corner
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+OUT = "/content/cosmo_measurement"
+os.makedirs(f"{OUT}/data", exist_ok=True)
+os.makedirs(f"{OUT}/figures", exist_ok=True)
+
+# ============================================================
+# 1. DATA DOWNLOAD
+# ============================================================
+urls = {
+    "desi_mean.txt": "https://raw.githubusercontent.com/CobayaSampler/bao_data/master/desi_bao_dr2/desi_gaussian_bao_ALL_GCcomb_mean.txt",
+    "desi_cov.txt":  "https://raw.githubusercontent.com/CobayaSampler/bao_data/master/desi_bao_dr2/desi_gaussian_bao_ALL_GCcomb_cov.txt",
+    "pantheon.dat":  "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/Pantheon%2BSH0ES.dat",
+    "pantheon.cov":  "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/Pantheon%2BSH0ES_STAT%2BSYS.cov",
+}
+for fname, url in urls.items():
+    path = f"{OUT}/data/{fname}"
+    if not os.path.exists(path):
+        print(f"Downloading {fname}...")
+        urllib.request.urlretrieve(url, path)
+print("Data ready.")
+
+# ============================================================
+# 2. PARSING
+# ============================================================
+# DESI DR2
+with open(f"{OUT}/data/desi_mean.txt") as f:
+    lines = f.readlines()
+dz, dv, dt = [], [], []
+for line in lines:
+    line = line.strip()
+    if not line or line.startswith('#'): continue
+    p = line.split()
+    if len(p) < 3: continue
+    try:
+        z = float(p[0]); v = float(p[1]); t = p[2].lower()
+        if   'dm_over_rs' in t: typ = 1
+        elif 'dh_over_rs' in t: typ = 2
+        elif 'dv_over_rs' in t: typ = 3
+        else: continue
+        dz.append(z); dv.append(v); dt.append(typ)
+    except ValueError: continue
+desi_z = np.array(dz); desi_val = np.array(dv); desi_type = np.array(dt, dtype=int)
+
+# DESI covariance - handle 1D or 2D
+desi_cov_raw = np.loadtxt(f"{OUT}/data/desi_cov.txt", comments='#')
+N_desi = len(desi_z)
+if desi_cov_raw.ndim == 1:
+    if desi_cov_raw.size == N_desi * N_desi:
+        desi_cov = desi_cov_raw.reshape(N_desi, N_desi)
+    elif desi_cov_raw.size == N_desi:
+        desi_cov = np.diag(desi_cov_raw)
+    else:
+        raise ValueError(f"DESI cov size mismatch: {desi_cov_raw.size}, expected {N_desi*N_desi} or {N_desi}")
+else:
+    desi_cov = desi_cov_raw
+desi_cho = cho_factor(desi_cov, lower=True)
+print(f"DESI DR2: {len(desi_z)} points, cov shape {desi_cov.shape}")
+
+# Pantheon+
+with open(f"{OUT}/data/pantheon.dat") as f:
+    header = f.readline().strip().split()
+    cols = {n: i for i, n in enumerate(header)}
+    rows = [l.split() for l in f if len(l.split()) >= len(header)]
+z_all = np.array([float(r[cols['zHD']]) for r in rows])
+mu_all = np.array([float(r[cols['MU_SH0ES']]) for r in rows])
+sig_all = np.array([float(r[cols['MU_SH0ES_ERR_DIAG']]) for r in rows])
+mask = (z_all > 0.01) & np.isfinite(mu_all) & (sig_all > 0)
+idx_keep = np.where(mask)[0]
+z_sn, mu_sn = z_all[mask], mu_all[mask]
+print(f"Pantheon+: {len(z_sn)} SNe (z > 0.01)")
+
+# Pantheon+ covariance - FIXED: skip header line
+with open(f"{OUT}/data/pantheon.cov") as f:
+    first_line = f.readline().strip()
+    try:
+        N_cov = int(first_line)
+        skiprows = 1
+        print(f"  Pantheon+ cov header N = {N_cov}")
+    except ValueError:
+        N_cov = None
+        skiprows = 0
+        print(f"  Pantheon+ cov has no integer header")
+
+cov_flat = np.loadtxt(f"{OUT}/data/pantheon.cov", skiprows=skiprows)
+print(f"  Loaded {cov_flat.size} values")
+
+if cov_flat.ndim == 1:
+    total = cov_flat.size
+    if N_cov is not None and N_cov * N_cov == total:
+        N_sqrt = N_cov
+    else:
+        N_sqrt = int(round(np.sqrt(total)))
+    if N_sqrt * N_sqrt != total:
+        raise ValueError(f"Cannot reshape {total} values into square matrix "
+                         f"(sqrt = {np.sqrt(total):.3f})")
+    cov_full = cov_flat.reshape(N_sqrt, N_sqrt)
+else:
+    cov_full = cov_flat
+    N_sqrt = cov_full.shape[0]
+
+print(f"Pantheon+ full cov shape: {cov_full.shape}")
+cov_sn = cov_full[np.ix_(idx_keep, idx_keep)]
+print(f"Pantheon+ sub-cov shape: {cov_sn.shape}")
+
+c_cho = cho_factor(cov_sn, lower=True)
+Cinv_1 = cho_solve(c_cho, np.ones(len(z_sn)))
+C_scalar = float(np.dot(np.ones(len(z_sn)), Cinv_1))
+print(f"C_scalar = {C_scalar:.4f}")
+
+# ============================================================
+# 3. CONSTANTS AND MODEL
+# ============================================================
+c_kms = 299792.458
+l_A_obs, l_A_sig = 301.47, 0.09
+R_obs, R_sig = 1.750, 0.005
+z_star, z_drag = 1090.0, 1059.94
+ob_h2, oc_h2 = 0.02242, 0.1198
+Og0, Or0 = 5.44e-5, 9.15e-5
+
+Z_GRID = np.linspace(0.0, 3.0, 600)
+
+def E_lcdm(z, H0, Omh2):
+    h = H0/100.0
+    Om0 = Omh2/h**2
+    OL0 = 1.0 - Om0 - Or0
+    return np.sqrt(Om0*(1+z)**3 + Or0*(1+z)**4 + OL0)
+
+def DM_fast(z_arr, H0, Omh2):
+    E_grid = E_lcdm(Z_GRID, H0, Omh2)
+    inv_E = 1.0/E_grid
+    dz = Z_GRID[1] - Z_GRID[0]
+    cum = np.concatenate([[0], np.cumsum(0.5*(inv_E[1:]+inv_E[:-1])*dz)])
+    return np.interp(z_arr, Z_GRID, cum) * c_kms / H0
+
+def build_model(H0, Omh2):
+    h = H0/100.0
+    Om0 = Omh2/h**2
+    OL0 = 1.0 - Om0 - Or0
+    Om_b = ob_h2/h**2
+    def E(z): return np.sqrt(Om0*(1+z)**3 + Or0*(1+z)**4 + OL0)
+    def DM(z):
+        if z <= 0: return 0.0
+        v,_ = quad(lambda zp: 1.0/E(zp), 0, z, limit=300, epsabs=1e-8, epsrel=1e-8)
+        return (c_kms/H0)*v
+    def DH(z): return c_kms/(H0*E(z))
+    def DV(z): return (z*DM(z)**2*DH(z))**(1/3)
+    def rs(z_end, z_start=1e7):
+        def integrand(z):
+            R = 3.0*Om_b/(4.0*Og0)/(1+z)
+            return (c_kms/np.sqrt(3.0*(1.0 + R)))/(H0*E(z))
+        v,_ = quad(integrand, z_end, z_start, limit=400, epsabs=1e-10, epsrel=1e-8)
+        return v
+    return dict(E=E, DM=DM, DH=DH, DV=DV,
+                rd=lambda: rs(z_drag), rs_star=lambda: rs(z_star),
+                Om0=Om0, OL0=OL0)
+
+# ============================================================
+# 4. LIKELIHOOD
+# ============================================================
+def log_like(theta):
+    H0, Omh2 = theta
+    if not (55 < H0 < 85): return -np.inf
+    if not (0.10 < Omh2 < 0.20): return -np.inf
+    try:
+        m = build_model(H0, Omh2)
+        # SNe Ia
+        DM_sn = DM_fast(z_sn, H0, Omh2)
+        mu_m = 5.0*np.log10((1+z_sn)*DM_sn) + 25.0
+        delta = mu_sn - mu_m
+        Cinv_delta = cho_solve(c_cho, delta)
+        A = float(np.dot(delta, Cinv_delta))
+        B = float(np.dot(Cinv_1, delta))
+        chi2_sn = A - B**2/C_scalar
+
+        # DESI DR2
+        rd = m['rd']()
+        if not (100 < rd < 250): return -np.inf
+        pred = np.zeros(len(desi_z))
+        for i, (z, t) in enumerate(zip(desi_z, desi_type)):
+            if   t == 1: pred[i] = m['DM'](z)/rd
+            elif t == 2: pred[i] = m['DH'](z)/rd
+            else:        pred[i] = m['DV'](z)/rd
+        d = desi_val - pred
+        chi2_desi = float(d @ cho_solve(desi_cho, d))
+
+        # CMB shift
+        lA = np.pi * m['DM'](z_star) / m['rs_star']()
+        R = np.sqrt(m['Om0']) * H0 * m['DM'](z_star) / c_kms
+        chi2_cmb = ((lA-l_A_obs)/l_A_sig)**2 + ((R-R_obs)/R_sig)**2
+
+        return -0.5*(chi2_sn + chi2_desi + chi2_cmb)
+    except Exception as e:
+        return -np.inf
+
+# ============================================================
+# 5. MCMC
+# ============================================================
+np.random.seed(42)
+nw, ns, bi = 32, 2500, 700
+ndim = 2
+
+p0 = np.array([67.4, 0.1422]) + 1e-3*np.random.randn(nw, ndim)
+
+print("\nRunning MCMC...")
+t0 = time.time()
+sampler = emcee.EnsembleSampler(nw, ndim, log_like)
+sampler.run_mcmc(p0, ns, progress=True)
+print(f"Time: {time.time()-t0:.1f}s")
+
+chain_full = sampler.get_chain()
+logp_full  = sampler.get_log_prob()
+chain = sampler.get_chain(discard=bi, flat=True)
+logp  = sampler.get_log_prob(discard=bi, flat=True)
+
+np.save(f"{OUT}/chain_full.npy", chain_full)
+np.save(f"{OUT}/logp_full.npy", logp_full)
+np.save(f"{OUT}/chain_flat.npy", chain)
+np.save(f"{OUT}/logp_flat.npy", logp)
+
+# ============================================================
+# 6. STATISTICS
+# ============================================================
+H0_samples = chain[:, 0]
+Omh2_samples = chain[:, 1]
+
+H0_mean = float(np.mean(H0_samples))
+H0_std  = float(np.std(H0_samples))
+Om_mean = float(np.mean(Omh2_samples))
+Om_std  = float(np.std(Omh2_samples))
+
+imax = np.argmax(logp)
+best = chain[imax]
+chi2_best = -2*log_like(best)
+
+try:
+    tau = sampler.get_autocorr_time(discard=bi, quiet=True)
+    ess_H0 = float(32*(ns-bi)/tau[0])
+    ess_Om = float(32*(ns-bi)/tau[1])
+except Exception:
+    ess_H0 = ess_Om = np.nan
+
+N_total = len(desi_z) + len(z_sn) + 2
+
+Omh2_planck = 0.14222
+Omh2_planck_sigma = 0.00083
+deviation_sigma = (Om_mean - Omh2_planck) / np.sqrt(Om_std**2 + Omh2_planck_sigma**2)
+
+print("\n" + "="*65)
+print("RESULTS")
+print("="*65)
+print(f"H0        = {H0_mean:.2f} +/- {H0_std:.2f} km/s/Mpc")
+print(f"Omh2      = {Om_mean:.5f} +/- {Om_std:.5f}")
+print(f"chi2_best = {chi2_best:.2f}")
+print(f"ESS(H0)   = {ess_H0:.0f}, ESS(Omh2) = {ess_Om:.0f}")
+print(f"Planck: Omh2 = {Omh2_planck:.5f} +/- {Omh2_planck_sigma:.5f}")
+print(f"Deviation: {deviation_sigma:+.2f} sigma")
+
+results = {
+    "H0_mean": H0_mean, "H0_std": H0_std,
+    "Omh2_mean": Om_mean, "Omh2_std": Om_std,
+    "chi2_best": float(chi2_best),
+    "ESS_H0": ess_H0, "ESS_Omh2": ess_Om,
+    "N_total": N_total,
+    "Omh2_planck": Omh2_planck,
+    "deviation_sigma": float(deviation_sigma),
+    "timestamp": datetime.now().isoformat(),
+}
+with open(f"{OUT}/results.json", "w") as f:
+    json.dump(results, f, indent=2)
+
+# ============================================================
+# 7. FIGURES
+# ============================================================
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+axes[0].plot(chain_full[:, :, 0], alpha=0.3)
+axes[0].set_xlabel('step'); axes[0].set_ylabel('$H_0$'); axes[0].set_title('Trace $H_0$')
+axes[1].plot(chain_full[:, :, 1], alpha=0.3)
+axes[1].set_xlabel('step'); axes[1].set_ylabel('$\\Omega_m h^2$'); axes[1].set_title('Trace $\\Omega_m h^2$')
+plt.tight_layout()
+plt.savefig(f"{OUT}/figures/traces.png", dpi=150, bbox_inches='tight')
+plt.close()
+
+fig = corner.corner(chain, labels=['$H_0$', '$\\Omega_m h^2$'],
+                    truths=[67.4, Omh2_planck], quantiles=[0.16, 0.5, 0.84],
+                    show_titles=True, title_fmt='.5f', truth_color='red')
+plt.savefig(f"{OUT}/figures/corner.png", dpi=150, bbox_inches='tight')
+plt.close()
+
+print("Figures saved.")
+
+# ============================================================
+# 8. PACKAGE
+# ============================================================
+zip_path = "/content/cosmo_measurement.zip"
+with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+    for root, _, files in os.walk(OUT):
+        for file in files:
+            full = os.path.join(root, file)
+            z.write(full, arcname=os.path.relpath(full, OUT))
+
+print(f"\nPackage: {zip_path} ({os.path.getsize(zip_path)/(1024*1024):.1f} MB)")
+
+try:
+    from google.colab import files
+    files.download(zip_path)
+except:
+    pass
+
+print("\nDONE.")

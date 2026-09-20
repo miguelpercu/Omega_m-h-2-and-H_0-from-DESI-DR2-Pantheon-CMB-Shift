@@ -1,0 +1,27 @@
+ Data ready.
+DESI DR2: 13 points, cov shape (13, 13)
+Pantheon+: 1590 SNe (z > 0.01)
+  Pantheon+ cov header N = 1701
+  Loaded 2893401 values
+Pantheon+ full cov shape: (1701, 1701)
+Pantheon+ sub-cov shape: (1590, 1590)
+C_scalar = 70470.7246
+
+Running MCMC...
+100%|██████████| 2500/2500 [16:44<00:00,  2.49it/s]
+Time: 1005.0s
+
+=================================================================
+RESULTS
+=================================================================
+H0        = 69.91 +/- 0.71 km/s/Mpc
+Omh2      = 0.14763 +/- 0.00126
+chi2_best = 1420.53
+ESS(H0)   = 2385, ESS(Omh2) = 2396
+Planck: Omh2 = 0.14222 +/- 0.00083
+Deviation: +3.59 sigma
+Figures saved.
+
+Package: /content/cosmo_measurement.zip (12.7 MB)
+
+DONE.
